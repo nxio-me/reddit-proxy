@@ -27,8 +27,8 @@ function fetchReddit(path) {
 }
 
 const server = http.createServer(async (req, res) => {
-  // Health check
-  if (req.url === "/health") {
+  // Health check (root + /health both return 200 for Coolify)
+  if (req.url === "/" || req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", cached: cache.size }));
     return;
