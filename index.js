@@ -22,12 +22,18 @@ const http = require("http");
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "";
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "1800", 10); // fresh: 30min
-const STALE_TTL = parseInt(process.env.STALE_TTL || "86400", 10); // stale fallback: 24h
+const STALE_TTL = parseInt(process.env.STALE_TTL || "172800", 10); // stale fallback: 48h
 const OAUTH_ID = process.env.REDDIT_CLIENT_ID || "";
 const OAUTH_SECRET = process.env.REDDIT_CLIENT_SECRET || "";
 const UA = "nxio-research/1.0 (feed aggregator; contact https://nxio.me)";
 
 const cache = new Map(); // sub -> { data, ts }
+// Subs the pipeline has ever requested; the warmer keeps their cache fresh.
+// Seed via WARM_SUBS env (comma-separated) to survive restarts.
+const knownSubs = new Set(
+  (process.env.WARM_SUBS || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean),
+);
+const WARM_INTERVAL = parseInt(process.env.WARM_INTERVAL || "600", 10); // one warm attempt per 10min
 let oauthToken = null; // { token, expiresAt }
 let lastUpstreamError = null; // { ts, sub, message } for /health diagnostics
 
@@ -156,6 +162,7 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         mode: OAUTH_ID && OAUTH_SECRET ? "oauth" : "anonymous",
         cached: cache.size,
+        known_subs: knownSubs.size,
         has_upstream_error: Boolean(lastUpstreamError),
         last_error_ts: lastUpstreamError ? lastUpstreamError.ts : null,
       }),
@@ -180,6 +187,7 @@ const server = http.createServer(async (req, res) => {
 
   const subreddit = match[1];
   const cacheKey = subreddit.toLowerCase();
+  knownSubs.add(cacheKey);
   const cached = cache.get(cacheKey);
 
   // Fresh cache hit
@@ -217,6 +225,26 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: err.message, first_attempt: err.firstMessage }));
   }
 });
+
+// Cache warmer: Reddit blocks this IP *intermittently* — instead of only
+// trying at pipeline fetch time, softly retry one known sub per interval
+// (round-robin, jittered). A single 200 per sub per day keeps its feed
+// servable via the stale window. Very low request rate by design.
+let warmIdx = 0;
+setInterval(() => {
+  const subs = [...knownSubs];
+  if (subs.length === 0) return;
+  const sub = subs[warmIdx++ % subs.length];
+  const entry = cache.get(sub);
+  if (entry && Date.now() - entry.ts < (CACHE_TTL * 1000) / 2) return; // still fresh enough
+  setTimeout(() => {
+    fetchFeed(sub)
+      .then((feed) => cache.set(sub, { data: feed, ts: Date.now() }))
+      .catch((err) => {
+        lastUpstreamError = { ts: new Date().toISOString(), sub, message: err.message };
+      });
+  }, Math.floor(Math.random() * 30000)); // jitter up to 30s
+}, WARM_INTERVAL * 1000).unref();
 
 // Cleanup cache entries past stale window every 10min
 setInterval(() => {
