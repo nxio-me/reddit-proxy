@@ -33,10 +33,18 @@ let lastUpstreamError = null; // { ts, sub, message } for /health diagnostics
 
 function xmlEscape(s) {
   return String(s)
+    // strip XML-1.0-illegal control chars and lone surrogates first
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFE\uFFFF]/g, "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// slice on codepoint boundaries so we never split a surrogate pair
+function safeSlice(s, n) {
+  return Array.from(String(s)).slice(0, n).join("");
 }
 
 async function getOauthToken() {
@@ -86,7 +94,7 @@ async function fetchViaOauth(subreddit) {
       const link = `https://www.reddit.com${d.permalink}`;
       const published = new Date((d.created_utc || 0) * 1000).toISOString();
       const content = d.selftext
-        ? xmlEscape(d.selftext.slice(0, 4000))
+        ? xmlEscape(safeSlice(d.selftext, 4000))
         : xmlEscape(d.url || link);
       return [
         "  <entry>",
@@ -148,7 +156,8 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         mode: OAUTH_ID && OAUTH_SECRET ? "oauth" : "anonymous",
         cached: cache.size,
-        last_upstream_error: lastUpstreamError,
+        has_upstream_error: Boolean(lastUpstreamError),
+        last_error_ts: lastUpstreamError ? lastUpstreamError.ts : null,
       }),
     );
     return;
@@ -199,7 +208,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, {
         "Content-Type": "application/rss+xml; charset=utf-8",
         "X-Cache": "STALE",
-        "X-Upstream-Error": String(err.message).slice(0, 120),
+        "X-Upstream-Error": String(err.message).replace(/[\r\n]/g, " ").slice(0, 120),
       });
       res.end(cached.data);
       return;
